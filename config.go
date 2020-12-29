@@ -7,12 +7,12 @@ import (
 )
 
 type config struct {
-	onlyDegression bool
-	threshold      float64
+	benchCmd       string
 	base           string
 	compare        []string
-	benchCmd       string
 	benchArgs      []string
+	onlyDegression bool
+	threshold      float64
 }
 
 func newConfig(c *cli.Context) config {
