@@ -76,6 +76,39 @@ func main() {
 	}
 }
 
+func hasLFS(repo *git.Repository) (bool, error) {
+	if repo == nil {
+		return false, nil
+	}
+
+	config, err := repo.Config()
+	if err != nil {
+		return false, fmt.Errorf("getting repo config: %w", err)
+	}
+
+	return config.Raw.HasSection("lfs"), nil
+}
+
+func lfsPull(repo *git.Repository) error {
+	ok, err := hasLFS(repo)
+	if err != nil {
+		return err
+	}
+
+	if !ok {
+		return nil
+	}
+
+	execLFSPull := exec.Command("git", "lfs", "pull")
+
+	err = execLFSPull.Run()
+	if err != nil {
+		return fmt.Errorf("pulling changes from git lfs: %w", err)
+	}
+
+	return nil
+}
+
 func run(c config) error {
 	r, err := git.PlainOpen(".")
 	if err != nil {
@@ -107,14 +140,14 @@ func run(c config) error {
 		return xerrors.Errorf("unable to get a worktree based on the given fs: %w", err)
 	}
 
-	s, err := w.Status()
-	if err != nil {
-		return xerrors.Errorf("unable to get the working tree status: %w", err)
-	}
+	// s, err := w.Status()
+	// if err != nil {
+	// 	return xerrors.Errorf("unable to get the working tree status: %w", err)
+	// }
 
-	if !s.IsClean() {
-		return xerrors.New("the repository is dirty: commit all changes before running 'cob'")
-	}
+	// if !s.IsClean() {
+	// 	return xerrors.New("the repository is dirty: commit all changes before running 'cob'")
+	// }
 
 	err = w.Reset(&git.ResetOptions{Commit: *prev, Mode: git.HardReset})
 	if err != nil {
@@ -124,6 +157,11 @@ func run(c config) error {
 	defer func() {
 		_ = w.Reset(&git.ResetOptions{Commit: head.Hash(), Mode: git.HardReset})
 	}()
+
+	err = lfsPull(r)
+	if err != nil {
+		return xerrors.Errorf("failed to pull LFS objects: %w", err)
+	}
 
 	log.Printf("Run Benchmark: %s %s", prev, c.base)
 
@@ -135,6 +173,11 @@ func run(c config) error {
 	err = w.Reset(&git.ResetOptions{Commit: head.Hash(), Mode: git.HardReset})
 	if err != nil {
 		return xerrors.Errorf("failed to reset the worktree to HEAD: %w", err)
+	}
+
+	err = lfsPull(r)
+	if err != nil {
+		return xerrors.Errorf("failed to pull LFS objects: %w", err)
 	}
 
 	log.Printf("Run Benchmark: %s %s", head.Hash(), "HEAD")
