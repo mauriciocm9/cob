@@ -1,4 +1,4 @@
-module github.com/knqyf263/cob
+module github.com/JuanJoseGonGi/cob
 
 go 1.13
 
