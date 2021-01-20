@@ -99,6 +99,8 @@ func lfsPull(repo *git.Repository) error {
 		return nil
 	}
 
+	log.Println("Pulling LFS objects")
+
 	execLFSPull := exec.Command("git", "lfs", "pull")
 
 	err = execLFSPull.Run()
