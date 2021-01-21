@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	git "github.com/go-git/go-git/v5"
@@ -76,34 +77,79 @@ func main() {
 	}
 }
 
-func hasLFS(repo *git.Repository) (bool, error) {
-	if repo == nil {
+func closeOrLog(closer io.Closer) {
+	if closer == nil {
+		return
+	}
+
+	err := closer.Close()
+	if err != nil {
+		log.Println(xerrors.Errorf("could not close %+v: %w", closer, err))
+	}
+}
+
+func findGitAttributesFilePath() (string, error) {
+	currentDir, err := os.Getwd()
+	if err != nil {
+		return "", xerrors.Errorf("failed to get current working dir: %w", err)
+	}
+
+	dir, err := filepath.Abs(currentDir)
+	if err != nil {
+		return "", xerrors.Errorf("invalid dir: %w", err)
+	}
+
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".gitattributes")); err == nil {
+			return filepath.Join(dir, ".gitattributes"), nil
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", nil
+		}
+
+		dir = parent
+	}
+}
+
+func hasLFS() (bool, error) {
+	log.Println("Checking if it contains LFS objects")
+
+	gitAttributesPath, err := findGitAttributesFilePath()
+	if err != nil {
+		return false, xerrors.Errorf("trying to find .gitattributes file path: %w", err)
+	}
+
+	if gitAttributesPath == "" {
 		return false, nil
 	}
 
-	config, err := repo.Config()
+	gitAttributesFile, err := os.Open(gitAttributesPath) // #nosec
 	if err != nil {
-		return false, fmt.Errorf("getting repo config: %w", err)
+		return false, xerrors.Errorf("opening .gitattributes file: %w", err)
 	}
 
-	return config.Raw.HasSection("lfs"), nil
+	defer closeOrLog(gitAttributesFile)
+
+	scanner := bufio.NewScanner(gitAttributesFile)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if strings.Contains(line, "=lfs") {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
-func lfsPull(repo *git.Repository) error {
-	ok, err := hasLFS(repo)
-	if err != nil {
-		return err
-	}
-
-	if !ok {
-		return nil
-	}
-
+func lfsPull() error {
 	log.Println("Pulling LFS objects")
 
 	execLFSPull := exec.Command("git", "lfs", "pull")
 
-	err = execLFSPull.Run()
+	err := execLFSPull.Run()
 	if err != nil {
 		return fmt.Errorf("pulling changes from git lfs: %w", err)
 	}
@@ -160,9 +206,16 @@ func run(c config) error {
 		_ = w.Reset(&git.ResetOptions{Commit: head.Hash(), Mode: git.HardReset})
 	}()
 
-	err = lfsPull(r)
+	hasLFSObjects, err := hasLFS()
 	if err != nil {
-		return xerrors.Errorf("failed to pull LFS objects: %w", err)
+		return err
+	}
+
+	if hasLFSObjects {
+		err = lfsPull()
+		if err != nil {
+			return xerrors.Errorf("failed to pull LFS objects: %w", err)
+		}
 	}
 
 	log.Printf("Run Benchmark: %s %s", prev, c.base)
@@ -177,9 +230,11 @@ func run(c config) error {
 		return xerrors.Errorf("failed to reset the worktree to HEAD: %w", err)
 	}
 
-	err = lfsPull(r)
-	if err != nil {
-		return xerrors.Errorf("failed to pull LFS objects: %w", err)
+	if hasLFSObjects {
+		err = lfsPull()
+		if err != nil {
+			return xerrors.Errorf("failed to pull LFS objects: %w", err)
+		}
 	}
 
 	log.Printf("Run Benchmark: %s %s", head.Hash(), "HEAD")
