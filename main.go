@@ -8,16 +8,16 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
-	"gopkg.in/src-d/go-git.v4/plumbing"
-
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"golang.org/x/xerrors"
 
 	"github.com/olekukonko/tablewriter"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/tools/benchmark/parse"
-	"gopkg.in/src-d/go-git.v4"
 )
 
 type result struct {
@@ -77,6 +77,86 @@ func main() {
 	}
 }
 
+func closeOrLog(closer io.Closer) {
+	if closer == nil {
+		return
+	}
+
+	err := closer.Close()
+	if err != nil {
+		log.Println(xerrors.Errorf("could not close %+v: %w", closer, err))
+	}
+}
+
+func findGitAttributesFilePath() (string, error) {
+	currentDir, err := os.Getwd()
+	if err != nil {
+		return "", xerrors.Errorf("failed to get current working dir: %w", err)
+	}
+
+	dir, err := filepath.Abs(currentDir)
+	if err != nil {
+		return "", xerrors.Errorf("invalid dir: %w", err)
+	}
+
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".gitattributes")); err == nil {
+			return filepath.Join(dir, ".gitattributes"), nil
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", nil
+		}
+
+		dir = parent
+	}
+}
+
+func hasLFS() (bool, error) {
+	log.Println("Checking if it contains LFS objects")
+
+	gitAttributesPath, err := findGitAttributesFilePath()
+	if err != nil {
+		return false, xerrors.Errorf("trying to find .gitattributes file path: %w", err)
+	}
+
+	if gitAttributesPath == "" {
+		return false, nil
+	}
+
+	gitAttributesFile, err := os.Open(gitAttributesPath) // #nosec
+	if err != nil {
+		return false, xerrors.Errorf("opening .gitattributes file: %w", err)
+	}
+
+	defer closeOrLog(gitAttributesFile)
+
+	scanner := bufio.NewScanner(gitAttributesFile)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if strings.Contains(line, "=lfs") {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func lfsPull() error {
+	log.Println("Pulling LFS objects")
+
+	execLFSPull := exec.Command("git", "lfs", "pull")
+
+	err := execLFSPull.Run()
+	if err != nil {
+		return fmt.Errorf("pulling changes from git lfs: %w", err)
+	}
+
+	return nil
+}
+
 func run(c config) error {
 	r, err := git.PlainOpen(".")
 	if err != nil {
@@ -86,6 +166,16 @@ func run(c config) error {
 	head, err := r.Head()
 	if err != nil {
 		return xerrors.Errorf("unable to get the reference where HEAD is pointing to: %w", err)
+	}
+
+	commit, err := r.CommitObject(head.Hash())
+	if err != nil {
+		return xerrors.Errorf("unable to get the head commit: %w", err)
+	}
+
+	if strings.Contains(strings.ToLower(commit.Message), "[skip cob]") {
+		log.Println("[skip cob] is detected, so the benchmark is skipped")
+		return nil
 	}
 
 	prev, err := r.ResolveRevision(plumbing.Revision(c.base))
@@ -98,14 +188,14 @@ func run(c config) error {
 		return xerrors.Errorf("unable to get a worktree based on the given fs: %w", err)
 	}
 
-	s, err := w.Status()
-	if err != nil {
-		return xerrors.Errorf("unable to get the working tree status: %w", err)
-	}
+	// s, err := w.Status()
+	// if err != nil {
+	// 	return xerrors.Errorf("unable to get the working tree status: %w", err)
+	// }
 
-	if !s.IsClean() {
-		return xerrors.New("the repository is dirty: commit all changes before running 'cob'")
-	}
+	// if !s.IsClean() {
+	// 	return xerrors.New("the repository is dirty: commit all changes before running 'cob'")
+	// }
 
 	err = w.Reset(&git.ResetOptions{Commit: *prev, Mode: git.HardReset})
 	if err != nil {
@@ -116,7 +206,20 @@ func run(c config) error {
 		_ = w.Reset(&git.ResetOptions{Commit: head.Hash(), Mode: git.HardReset})
 	}()
 
+	hasLFSObjects, err := hasLFS()
+	if err != nil {
+		return err
+	}
+
+	if hasLFSObjects {
+		err = lfsPull()
+		if err != nil {
+			return xerrors.Errorf("failed to pull LFS objects: %w", err)
+		}
+	}
+
 	log.Printf("Run Benchmark: %s %s", prev, c.base)
+
 	prevSet, err := runPreviousBenchmark(c.benchCmd, c.benchArgs)
 	if err != nil {
 		return xerrors.Errorf("failed to run a benchmark: %w", err)
@@ -127,20 +230,30 @@ func run(c config) error {
 		return xerrors.Errorf("failed to reset the worktree to HEAD: %w", err)
 	}
 
+	if hasLFSObjects {
+		err = lfsPull()
+		if err != nil {
+			return xerrors.Errorf("failed to pull LFS objects: %w", err)
+		}
+	}
+
 	log.Printf("Run Benchmark: %s %s", head.Hash(), "HEAD")
+
 	headSet, err := runBenchmark(c.benchCmd, c.benchArgs)
 	if err != nil {
 		return xerrors.Errorf("failed to run a benchmark: %w", err)
 	}
 
-	var ratios []result
-	var rows [][]string
+	ratios := make([]result, 0, len(headSet))
+	rows := make([][]string, 0, len(headSet))
+
 	for benchName, headBenchmarks := range headSet {
 		var prevBench, headBench *parse.Benchmark
 
 		if len(headBenchmarks) > 0 {
 			headBench = headBenchmarks[0]
 		}
+
 		rows = append(rows, generateRow("HEAD", headBench))
 
 		prevBenchmarks, ok := prevSet[benchName]
@@ -152,6 +265,7 @@ func run(c config) error {
 		if len(prevBenchmarks) > 0 {
 			prevBench = prevBenchmarks[0]
 		}
+
 		rows = append(rows, generateRow(c.base, prevBench))
 
 		var ratioNsPerOp float64
@@ -185,7 +299,8 @@ func run(c config) error {
 
 func runBenchmark(cmdStr string, args []string) (parse.Set, error) {
 	var stderr bytes.Buffer
-	cmd := exec.Command(cmdStr, args...)
+
+	cmd := exec.Command(cmdStr, args...) // #nosec
 	cmd.Stderr = &stderr
 
 	out, err := cmd.Output()
@@ -193,8 +308,10 @@ func runBenchmark(cmdStr string, args []string) (parse.Set, error) {
 		if strings.HasSuffix(strings.TrimSpace(stderr.String()), "no packages to test") {
 			return parse.Set{}, nil
 		}
+
 		log.Println(string(out))
 		log.Println(stderr.String())
+
 		return nil, xerrors.Errorf("failed to run '%s' command: %w", cmd, err)
 	}
 
@@ -202,6 +319,7 @@ func runBenchmark(cmdStr string, args []string) (parse.Set, error) {
 	if err != nil {
 		return nil, xerrors.Errorf("failed to parse a result of benchmarks: %w", err)
 	}
+
 	return s, nil
 }
 
@@ -211,6 +329,7 @@ func runPreviousBenchmark(cmdStr string, args []string) (parse.Set, error) {
 		log.Printf("previous benchmark failed: %s\n", err.Error())
 		return parse.Set{}, nil
 	}
+
 	return prevSet, err
 }
 
@@ -221,6 +340,7 @@ func parseBenchmark(data []byte) (parse.Set, error) {
 
 	benchmarkName := ""
 	bb := make(parse.Set)
+
 	for scan.Scan() {
 		t := scan.Text()
 
@@ -251,14 +371,18 @@ func parseLine(bb parse.Set, line string, ord int) bool {
 	if b, err := parse.ParseLine(line); err == nil {
 		b.Ord = ord
 		bb[b.Name] = append(bb[b.Name], b)
+
 		return true
 	}
+
 	return false
 }
 
 func generateRow(ref string, b *parse.Benchmark) []string {
-	return []string{b.Name, ref, fmt.Sprintf(" %.2f ns/op", b.NsPerOp),
-		fmt.Sprintf(" %d B/op", b.AllocedBytesPerOp)}
+	return []string{
+		b.Name, ref, fmt.Sprintf(" %.2f ns/op", b.NsPerOp),
+		fmt.Sprintf(" %d B/op", b.AllocedBytesPerOp),
+	}
 }
 
 func showResult(w io.Writer, rows [][]string) {
@@ -268,7 +392,9 @@ func showResult(w io.Writer, rows [][]string) {
 	table := tablewriter.NewWriter(w)
 	table.SetAutoFormatHeaders(false)
 	table.SetAlignment(tablewriter.ALIGN_CENTER)
+
 	headers := []string{"Name", "Commit", "NsPerOp", "AllocedBytesPerOp"}
+
 	table.SetHeader(headers)
 	table.SetAutoMergeCells(true)
 	table.SetRowLine(true)
@@ -281,10 +407,13 @@ func showRatio(w io.Writer, results []result, threshold float64, comparedScore c
 	table.SetAutoFormatHeaders(false)
 	table.SetAlignment(tablewriter.ALIGN_CENTER)
 	table.SetRowLine(true)
+
 	headers := []string{"Name", "NsPerOp", "AllocedBytesPerOp"}
+
 	table.SetHeader(headers)
 
 	var degression bool
+
 	for _, result := range results {
 		if comparedScore.nsPerOp && threshold < result.RatioNsPerOp {
 			degression = true
@@ -295,18 +424,24 @@ func showRatio(w io.Writer, results []result, threshold float64, comparedScore c
 				continue
 			}
 		}
+
 		row := []string{result.Name, generateRatioItem(result.RatioNsPerOp), generateRatioItem(result.RatioAllocedBytesPerOp)}
+
 		colors := []tablewriter.Colors{{}, generateColor(result.RatioNsPerOp), generateColor(result.RatioAllocedBytesPerOp)}
+
 		if !comparedScore.nsPerOp {
 			row[1] = "-"
 			colors[1] = tablewriter.Colors{}
 		}
+
 		if !comparedScore.allocedBytesPerOp {
 			row[2] = "-"
 			colors[2] = tablewriter.Colors{}
 		}
+
 		table.Rich(row, colors)
 	}
+
 	if table.NumLines() > 0 {
 		fmt.Fprintln(w, "\nComparison")
 		fmt.Fprintf(w, "%s\n\n", strings.Repeat("=", 10))
@@ -314,6 +449,7 @@ func showRatio(w io.Writer, results []result, threshold float64, comparedScore c
 		table.Render()
 		fmt.Fprintln(w)
 	}
+
 	return degression
 }
 
@@ -321,9 +457,11 @@ func generateRatioItem(ratio float64) string {
 	if -0.0001 < ratio && ratio < 0.0001 {
 		ratio = 0
 	}
+
 	if 0 <= ratio {
 		return fmt.Sprintf("%.2f%%", 100*ratio)
 	}
+
 	return fmt.Sprintf("%.2f%%", -100*ratio)
 }
 
@@ -331,18 +469,21 @@ func generateColor(ratio float64) tablewriter.Colors {
 	if ratio > 0 {
 		return tablewriter.Colors{tablewriter.Bold, tablewriter.FgHiRedColor}
 	}
+
 	return tablewriter.Colors{tablewriter.Bold, tablewriter.FgBlueColor}
 }
 
 func whichScoreToCompare(c []string) comparedScore {
-	var comparedScore comparedScore
+	var compardScore comparedScore
+
 	for _, cc := range c {
 		switch cc {
 		case "ns/op":
-			comparedScore.nsPerOp = true
+			compardScore.nsPerOp = true
 		case "B/op":
-			comparedScore.allocedBytesPerOp = true
+			compardScore.allocedBytesPerOp = true
 		}
 	}
-	return comparedScore
+
+	return compardScore
 }

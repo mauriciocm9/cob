@@ -13,10 +13,11 @@ func Test_showResult(t *testing.T) {
 		rows     [][]string
 		benchmem bool
 	}
+
 	tests := []struct {
 		name      string
-		args      args
 		wantTable string
+		args      args
 	}{
 		{
 			name: "happy path",
@@ -47,6 +48,7 @@ Result
 `,
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			w := &bytes.Buffer{}
@@ -64,11 +66,12 @@ func Test_showRatio(t *testing.T) {
 		compare        comparedScore
 		onlyDegression bool
 	}
+
 	tests := []struct {
 		name      string
+		wantTable string
 		args      args
 		want      bool
-		wantTable string
 	}{
 		{
 			name: "happy path",
@@ -213,10 +216,11 @@ func Test_generateRatioItem(t *testing.T) {
 	type args struct {
 		ratio float64
 	}
+
 	tests := []struct {
 		name string
-		args args
 		want string
+		args args
 	}{
 		{
 			name: "positive",
@@ -268,6 +272,7 @@ func Test_generateRatioItem(t *testing.T) {
 			want: "0.00%",
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := generateRatioItem(tt.args.ratio)
