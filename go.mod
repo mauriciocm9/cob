@@ -1,6 +1,6 @@
 module github.com/mauriciocm9/cob
 
-go 1.16
+go 1.14
 
 require (
 	github.com/Microsoft/go-winio v0.4.16 // indirect
